@@ -1,0 +1,25 @@
+from database import DatabaseManager
+import time
+
+# 1. Initialize
+db = DatabaseManager("test_debug.db")
+
+# 2. Simulate "Yesterday" (Fake History)
+# We manually insert a record from 24 hours ago
+print("🕒 Injecting fake history from 24h ago...")
+conn = db._get_conn()
+conn.execute(
+    "INSERT INTO star_history (repo_url, stars, recorded_at) VALUES (?, ?, datetime('now', '-24 hours'))",
+    ("https://github.com/test/fake-repo", 100) # Yesterday it had 100 stars
+)
+conn.commit()
+conn.close()
+
+# 3. Simulate "Today" (Current Run)
+current_stars = 150 # Today it has 150 stars
+growth, is_real = db.get_growth_stats("https://github.com/test/fake-repo", current_stars)
+
+print(f"\n📊 RESULTS:")
+print(f"Current Stars: {current_stars}")
+print(f"Growth detected: {growth} (Should be 50)")
+print(f"Is Real 24h Data: {is_real} (Should be True)")
