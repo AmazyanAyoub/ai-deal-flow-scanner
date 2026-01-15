@@ -15,7 +15,7 @@ load_dotenv()
 
 class JudgeAgent:
     def __init__(self):
-        # 1. Setup the LLM (Groq Llama 3 for speed, or GPT-4o for precision)
+        # 1. Setup the LLM
         if os.getenv("GROQ_API_KEY"):
             print("🧠 Loading Judge with Groq (Llama-3.3-70b)...")
             self.llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
@@ -23,14 +23,13 @@ class JudgeAgent:
             print("🧠 Loading Judge with OpenAI (GPT-4o)...")
             self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-        # 2. Setup the Parser (Enforces the 5-point scorecard)
+        # 2. Setup the Parser
         self.parser = PydanticOutputParser(pydantic_object=JudgeOutput)
 
-        # 3. Define the FULL VC Prompt
-        # 3. Define the VC Prompt (Russian Analyst Edition)
+        # 3. Define the VC Prompt (CLEANED - No Math)
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """
-            You are a strict AI Venture Capitalist writing for a top-tier Russian tech channel. 
+            You are a strict AI Venture Capitalist writing for a top-tier Ukrainian tech channel. 
             Your job is to evaluate projects and write a deep, analytical investment memo in Russian.
 
             ### YOUR SCORING CRITERIA (0-10)
@@ -42,7 +41,7 @@ class JudgeAgent:
 
             ### YOUR TASKS
             1. **Classify**: Pick category & confidence.
-            2. **Score**: Assign integer scores (0-10).
+            2. **Score**: Assign integer scores (0-10) based on the criteria above.
             3. **Draft the Post (REQUIRED)**: 
                - Write the post in **RUSSIAN** (Русский язык).
                - Strict "Deep Analysis" tone. No marketing fluff.
@@ -68,13 +67,6 @@ class JudgeAgent:
 
             **Честный риск:**
             [1 sentence about the main weakness/risk (e.g., complexity, stability, competition).]
-
-            ---
-            
-            4. **Decide**:
-               - Calculate SUM = Novelty + Market + Moat.
-               - IF SUM >= 18: final_decision="PUBLISH"
-               - IF SUM < 18: final_decision="REJECT"
             """),
             ("human", """
             Analyze this project:
@@ -102,6 +94,7 @@ class JudgeAgent:
     def evaluate(self, project: NormalizedProject) -> JudgeOutput:
         print(f"⚖️  VC Judging {project.title}...")
         try:
+            # 1. AI DOES THE THINKING (Scoring + Writing)
             result = self.chain.invoke({
                 "title": project.title,
                 "description": project.description,
@@ -112,11 +105,11 @@ class JudgeAgent:
                 "has_docker": project.signals.has_docker,
                 "has_ci": project.signals.has_ci,
                 "prod_score": project.signals.production_signals_count,
-                "raw_text": project.raw_text[:4000], # Limit context
+                "raw_text": project.raw_text[:4000], 
                 "format_instructions": self.parser.get_format_instructions()
             })
             
-            # --- LOGIC OVERRIDE: Enforce Client's Math Rule ---
+            # 2. PYTHON DOES THE MATH (Deterministic Logic)
             # Rule: Novelty + Market + Moat >= 18
             core_score = result.novelty + result.market_leverage + result.moat_potential
             
@@ -126,14 +119,13 @@ class JudgeAgent:
             project.signals.category_guess = result.category_guess
             project.signals.category_confidence = result.category_confidence
             
-            # Decision Logic
+            # 3. PYTHON DECIDES
             if core_score >= 18:
                 result.final_decision = "PUBLISH"
-                # The preview_post is GUARANTEED to exist because of the Schema + Prompt
                 print(f"   ✅ PASSED! (Score {core_score} >= 18)")
             else:
                 result.final_decision = "REJECT"
-                result.preview_post = None # We discard the draft because it failed the math
+                result.preview_post = None # Kill the draft if rejected
                 print(f"   ❌ REJECTED (Score {core_score} < 18)")
                 
             return result
@@ -144,13 +136,8 @@ class JudgeAgent:
 
 # --- Main Execution Flow (Test) ---
 if __name__ == "__main__":
-    # 1. Run Adapter (With new Hard Filters)
     adapter = GitHubAdapter()
-    
-    # Fetch 2 projects for testing
     projects = adapter.fetch_candidates(limit=2) 
-    
-    # 2. Run Judge
     judge = JudgeAgent()
     
     full_report = []
@@ -169,7 +156,6 @@ if __name__ == "__main__":
                 print(f"\n📢 DRAFT POST:\n{verdict.preview_post}")
                 print("-" * 60)
 
-    # Save to JSON (Client Requirement Section 7 Format)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     with open(f"final_output_{timestamp}.json", "w", encoding="utf-8") as f:
         json.dump(full_report, f, indent=4, ensure_ascii=False)
