@@ -1,195 +1,141 @@
 import os
-from datetime import datetime, timezone
-from typing import List
+from datetime import datetime, timezone, timedelta
 from github import Github, Auth
-from dotenv import load_dotenv
-
-# Import our tools
-from schemas import NormalizedProject, ProjectMetrics, ProductionSignals
 from database import DatabaseManager
-
-load_dotenv()
+from schemas import NormalizedProject, ProjectMetrics, ProductionSignals
 
 class GitHubAdapter:
     def __init__(self):
         token = os.getenv("GITHUB_TOKEN")
         if not token:
-            raise ValueError("GITHUB_TOKEN not found in .env file")
-        
+            raise ValueError("❌ GITHUB_TOKEN manquant dans le .env")
         self.client = Github(auth=Auth.Token(token))
         self.db = DatabaseManager()
-
-        # --- CLIENT CONFIGURATION ---
         
-        # 1. Broad Search Query (Client Section 3: Languages)
-        # We capture everything first, then filter strictly below.
-        self.SEARCH_QUERY = "topic:ai language:python"
-        
-        # 2. Target Keywords (Client Section 3)
-        # Must appear in Name, Description, or README
+        # FIX 1: RESTORE FULL CLIENT KEYWORDS
         self.TARGET_KEYWORDS = [
             "agent", "orchestration", "inference", "rag", "eval",
             "workflow", "automation", "devtools", "infra", "observability"
         ]
-        
-        # 3. Readme Quality Keywords (Client Section 5.2)
-        self.README_KEYWORDS = [
-            "use case", "problem", "solution", "why", "example", 
-            "quickstart", "demo", "workflow"
-        ]
-        
-        # 4. Production Signal Keywords (Client Section 6.2)
-        self.PROD_KEYWORDS = ["production", "deploy", "self-hosted", "on-prem", "latency", "cost"]
 
-    def fetch_candidates(self, limit: int = 10) -> List[NormalizedProject]:
-        """
-        Main Loop: Search -> Strict Filters (5.1 - 5.4) -> Signals -> Normalize
-        """
-        print(f"🔎 Searching GitHub (Query: {self.SEARCH_QUERY})...")
+    def fetch_candidates(self, scan_limit=10):
+        # Broad scan for <90 days to capture potential candidates
+        date_limit = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+        query = f"ai OR agent OR llm created:>{date_limit}"
         
-        # Note: 'sort' is passed here to fix the previous API error
-        results = self.client.search_repositories(
-            query=self.SEARCH_QUERY, 
-            sort="updated", 
-            order="desc"
-        )
+        print(f"🔎 [FETCHED] Querying GitHub: {query}")
+        repos = self.client.search_repositories(query=query, sort="stars", order="desc")
         
-        candidates = []
+        passed_to_ai, audit_log = [], []
         count = 0
-        
-        for repo in results:
-            if count >= limit:
+
+        for repo in repos:
+            if count >= scan_limit: 
+                print(f"🛑 Scan limit of {scan_limit} reached. Stopping.")
                 break
             
-            print(f"\n👀 Checking: {repo.name} ({repo.stargazers_count} stars)")
+            # --- 1. IGNORE ALREADY JUDGED ---
+            if self.db.is_judged(repo.html_url):
+                # We already said Publish or Reject. Skip.
+                print(f"   ⏭️  [SKIPPED] {repo.name} already judged.")
+                continue 
 
-            # --- 1. KEYWORD FILTER (Client Section 3) ---
-            # Check Name and Description first (fastest)
-            text_to_scan = (repo.name + " " + (repo.description or "")).lower()
-            if not any(k in text_to_scan for k in self.TARGET_KEYWORDS):
-                # If not in name/desc, we will check README later as a last resort
-                keywords_found_in_meta = False
-            else:
-                keywords_found_in_meta = True
-
-            # --- 2. AGE FILTER (Client Section 5.1) ---
-            # Rule: age_days <= 90
-            created_at = repo.created_at.replace(tzinfo=timezone.utc)
-            age_days = (datetime.now(timezone.utc) - created_at).days
+            # --- 2. THE AGE GATE (7 to 90 Days) ---
+            age_days = max(1, (datetime.now(timezone.utc) - repo.created_at).days)
+            
+            if age_days < 7:
+                # Too young (Less than a week). Ignore.
+                print(f"   ⏭️  [SKIPPED] {repo.name} too young ({age_days}d).")
+                continue
             
             if age_days > 90:
-                print(f"   🚫 Reject: Too old ({age_days} days)")
+                # Too old (Should be caught by query, but double checking).
                 continue
 
-            # --- 3. DYNAMICS & FALLBACK (Client Section 4) ---
-            # Save snapshot
-            self.db.save_snapshot(repo.html_url, repo.stargazers_count)
-            # Calculate 24h growth
-            stars_growth, is_real_data = self.db.get_growth_stats(repo.html_url, repo.stargazers_count)
+            # --- 3. THE MEAN VELOCITY CHECK ---
+            current_stars = repo.stargazers_count
+            daily_average = current_stars / age_days
             
-            # FALLBACK LOGIC: If no 24h history (Day 1), use Total Stars as proxy for filtering
-            effective_growth = stars_growth if is_real_data else repo.stargazers_count
-            if not is_real_data:
-                print(f"   ℹ️ First run: Using total stars ({effective_growth}) as growth proxy.")
+            if daily_average < 20:
+                # Too slow. (e.g. 100 days old but only 500 stars = 5 stars/day)
+                print(f"   ⏭️  [SKIPPED] {repo.name} too slow ({daily_average} stars/day).")
+                continue
+                
+            # --- 4. KEYWORDS & QUALITY FILTER ---
+            # If it passed the math, NOW we spend resources checking text.
+            text_to_scan = (repo.name + " " + (repo.description or "")).lower()
+            readme = self._get_readme(repo)
+            full_text = text_to_scan + " " + readme.lower()
+            
+            if not any(k in full_text for k in self.TARGET_KEYWORDS):
+                print(f"   ⏭️  [SKIPPED] {repo.name} missing target keywords.")
+                continue 
 
-            # --- 4. ACTIVITY FILTER (Client Section 5.4) ---
-            # Rule: last_commit <= 14 days OR stars_last_24h >= 30
-            last_pushed = repo.pushed_at.replace(tzinfo=timezone.utc)
-            days_since_push = (datetime.now(timezone.utc) - last_pushed).days
+            q_keywords = ["use case", "problem", "solution", "why", "example", "quickstart", "demo", "workflow"]
+            kw_found = sum(1 for kw in q_keywords if kw in readme.lower())
+            readme_ok = len(readme) >= 800 and kw_found >= 2
             
-            is_active = days_since_push <= 14
-            is_viral = effective_growth >= 30
-            
-            if not (is_active or is_viral):
-                print(f"   🚫 Reject: Inactive ({days_since_push}d) and not viral ({effective_growth} stars)")
+            if not readme_ok:
+                print(f"   ⏭️  [SKIPPED] {repo.name} weak README.")
                 continue
 
-            # --- 5. README & CONTENT FILTER (Client Section 5.2) ---
-            readme_content = self._get_readme(repo)
+            # --- 5. SNAPSHOT & ACCEPT ---
+            # It passed everything. We accept it NOW. 
+            current_forks = repo.forks_count
             
-            # A. Check Meaningful (Length > 800 + Keywords)
-            if not self._is_readme_meaningful(readme_content):
-                print(f"   🚫 Reject: Readme too short or weak")
-                continue
+            # Save history (for reference), but we don't wait.
+            self.db.save_snapshot(repo.html_url, current_stars, current_forks)
             
-            # B. Final Keyword Check (if missed in Name/Desc)
-            if not keywords_found_in_meta:
-                if not any(k in readme_content.lower() for k in self.TARGET_KEYWORDS):
-                    print(f"   🚫 Reject: No target keywords (agent, rag, etc.) found anywhere")
-                    continue
-
-            # --- 6. PRODUCTION SIGNALS (Client Section 6.2) ---
-            signals = self._extract_production_signals(repo, readme_content)
-
-            # --- 7. GROWTH FILTER (Client Section 5.3) ---
-            # Rule: Growth >= 20 OR (Growth >= 10 AND Signals >= 2)
-            # has_high_growth = effective_growth >= 20
-            # has_med_growth_pro = (effective_growth >= 10 and signals.production_signals_count >= 2)
+            prod_data = self._extract_prod_signals(repo, readme)
             
-            # if not (has_high_growth or has_med_growth_pro):
-            #     print(f"   🚫 Reject: Low growth ({effective_growth}) & low signals")
-            #     continue
-
-            # --- ✅ PASSED ALL FILTERS ---
-            print(f"   ✅ CANDIDATE ACCEPTED!")
-            
-            candidate = NormalizedProject(
-                id=repo.html_url,
+            count += 1
+            project = NormalizedProject(
                 source="github",
                 title=repo.name,
-                url=repo.html_url,
                 description=repo.description,
-                created_at=created_at,
+                url=repo.html_url,
                 metrics=ProjectMetrics(
-                    stars_24h=stars_growth, # Report REAL growth (0 on day 1), not proxy
-                    stars_total=repo.stargazers_count,
-                    forks_24h=0,
+                    stars_24h=int(daily_average), # We use Mean as the "Speed" metric now
+                    stars_total=current_stars, 
+                    forks_24h=0, # Not relevant in this logic
                     age_days=age_days,
-                    last_commit_date=last_pushed
+                    last_commit_date=repo.pushed_at.replace(tzinfo=timezone.utc)
                 ),
-                signals=signals,
-                raw_text=f"README:\n{readme_content[:3000]}\n\nFILE STRUCTURE:\n{str(self._get_file_structure(repo))}"
+                signals=ProductionSignals(
+                    has_docker=prod_data["has_docker"], 
+                    has_ci=prod_data["has_ci"], 
+                    production_signals=prod_data["production_signals"],
+                    category_guess="pending",
+                    category_confidence=0.0
+                ),
+                raw_text=readme[:3000]
             )
+            passed_to_ai.append(project)
+            print(f"   ✅ [SAVED] {repo.name} (Age: {age_days}d, Avg: {int(daily_average)} stars/day)")
             
-            candidates.append(candidate)
-            count += 1
+            audit_log.append({"name": repo.name, "url": repo.html_url, "status": "Publish"})
 
-        return candidates
+        return passed_to_ai, audit_log
 
-    # --- HELPER METHODS ---
-
-    def _get_readme(self, repo) -> str:
+    def _get_readme(self, repo):
         try:
             return repo.get_readme().decoded_content.decode("utf-8")
         except:
             return ""
 
-    def _is_readme_meaningful(self, content: str) -> bool:
-        if len(content) < 800:
-            return False
-        found = [kw for kw in self.README_KEYWORDS if kw in content.lower()]
-        return len(found) >= 2
-
-    def _extract_production_signals(self, repo, readme_content: str) -> ProductionSignals:
-        files = self._get_file_structure(repo)
-        text = readme_content.lower()
-        
-        has_docker = any("docker" in f.lower() for f in files)
-        has_ci = any(".github/workflows" in f or ".circleci" in f for f in files)
-        keyword_count = sum(1 for kw in self.PROD_KEYWORDS if kw in text)
-        
-        total = int(has_docker) + int(has_ci) + keyword_count
-        
-        return ProductionSignals(
-            has_docker=has_docker,
-            has_ci=has_ci,
-            production_signals_count=total,
-            category_guess="other",
-            category_confidence=0.0
-        )
-
-    def _get_file_structure(self, repo) -> List[str]:
+    def _extract_prod_signals(self, repo, readme):
+        has_docker = False
+        has_ci = False
         try:
-            return [c.path for c in repo.get_contents("")]
-        except:
-            return []
+            files = [f.path.lower() for f in repo.get_contents("")]
+            has_docker = any("dockerfile" in f or "docker-compose" in f for f in files)
+            try:
+                repo.get_contents(".github/workflows")
+                has_ci = True
+            except: pass
+        except: pass
+        
+        kws = ["production", "deploy", "self-hosted", "on-prem", "latency", "cost"]
+        mentions = sum(1 for kw in kws if kw in readme.lower())
+        total = int(has_docker) + int(has_ci) + mentions
+        return {"has_docker": has_docker, "has_ci": has_ci, "production_signals": total}

@@ -1,1 +1,10 @@
 .env
+
+*.ipynb
+
+*__pycache__/
+
+*.db
+*.json
+
+*.log

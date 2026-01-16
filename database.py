@@ -1,78 +1,100 @@
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
-
-DB_NAME = "repo_history.db"
 
 class DatabaseManager:
-    def __init__(self, db_name=DB_NAME):
+    def __init__(self, db_name="investment_signals.db"):
         self.db_name = db_name
         self._init_db()
 
-    def _get_conn(self):
-        return sqlite3.connect(self.db_name)
-
     def _init_db(self):
-        """Creates the history table if it doesn't exist."""
-        conn = self._get_conn()
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS star_history (
-                repo_url TEXT,
-                stars INTEGER,
-                recorded_at DATETIME,
-                PRIMARY KEY (repo_url, recorded_at)
-            )
-        """)
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_name) as conn:
+            # Pour calculer les deltas (Point 4 & 6.1)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS metrics_history (
+                    url TEXT, stars INTEGER, forks INTEGER, recorded_at DATETIME,
+                    PRIMARY KEY (url, recorded_at)
+                )
+            """)
+            # Pour éviter les doublons IA (Point 2)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS processed_items (
+                    url TEXT PRIMARY KEY,
+                    title TEXT,
+                    description TEXT,
+                    stars_total INTEGER,
+                    velocity INTEGER,  -- This represents stars_24h/daily_average
+                    prod_score INTEGER,
+                    raw_text TEXT,
+                    decision TEXT,     -- 'PUBLISH' or 'REJECT'
+                    score INTEGER,     -- The VC Score (0-30)
+                    processed_at DATETIME
+                )
+            """)
+    def save_snapshot(self, url, stars, forks):
+        with sqlite3.connect(self.db_name) as conn:
+            conn.execute("INSERT OR REPLACE INTO metrics_history VALUES (?, ?, ?, ?)",
+                        (url, stars, forks, datetime.now()))
 
-    def save_snapshot(self, repo_url: str, stars: int):
-        """Saves the current star count with a timestamp."""
-        conn = self._get_conn()
-        cursor = conn.cursor()
+    def get_deltas(self, url, current_stars, current_forks):
         now = datetime.now()
-        cursor.execute(
-            "INSERT INTO star_history (repo_url, stars, recorded_at) VALUES (?, ?, ?)",
-            (repo_url, stars, now)
-        )
-        conn.commit()
-        conn.close()
-        print(f"💾 Snapshot saved for {repo_url.split('/')[-1]} ({stars} stars)")
+        # Fenêtre exigée par le client : 18-30h (Point 4)
+        start, end = now - timedelta(hours=30), now - timedelta(hours=18)
+        
+        with sqlite3.connect(self.db_name) as conn:
+            res = conn.execute("""
+                SELECT stars, forks FROM metrics_history 
+                WHERE url=? AND recorded_at BETWEEN ? AND ? 
+                ORDER BY recorded_at DESC LIMIT 1
+            """, (url, start, end)).fetchone()
+            
+            if res:
+                return (max(0, current_stars - res[0]), max(0, current_forks - res[1]), True)
+            
+            # Fallback : stars_since_first_seen (Point 4)
+            first = conn.execute("SELECT stars, forks FROM metrics_history WHERE url=? ORDER BY recorded_at ASC LIMIT 1", (url,)).fetchone()
+            if first:
+                return (max(0, current_stars - first[0]), max(0, current_forks - first[1]), False)
+            return (0, 0, False)
 
-    def get_growth_stats(self, repo_url: str, current_stars: int) -> Tuple[int, bool]:
-        """
-        Calculates stars gained in the last ~24 hours.
-        Returns: (stars_gained, is_real_24h_data)
-        """
-        conn = self._get_conn()
-        cursor = conn.cursor()
-        
-        # 1. Define the '24 Hour' window (18h to 30h ago as per client specs)
-        now = datetime.now()
-        window_start = now - timedelta(hours=30)
-        window_end = now - timedelta(hours=18)
-        
-        # 2. Find a snapshot in that window
-        cursor.execute("""
-            SELECT stars, recorded_at FROM star_history
-            WHERE repo_url = ? AND recorded_at BETWEEN ? AND ?
-            ORDER BY recorded_at DESC
-            LIMIT 1
-        """, (repo_url, window_start, window_end))
-        
-        result = cursor.fetchone()
-        conn.close()
+    def is_judged(self, url):
+        with sqlite3.connect(self.db_name) as conn:
+            return conn.execute("SELECT url FROM processed_items WHERE url=?", (url,)).fetchone() is not None
 
-        if result:
-            # Case A: We found a snapshot from yesterday!
-            old_stars = result[0]
-            growth = current_stars - old_stars
-            return growth, True # True = This is real 24h data
-        else:
-            # Case B: No history (First time seeing this repo)
-            # Client Rule: "Temporarily use stars_since_first_seen"
-            # Since we just saved the snapshot, current - start = 0, 
-            # so for the VERY first run, we might rely on the Adapter to provide "stars_total" as a fallback heuristic
-            # BUT per strict logic: Return 0 growth relative to DB, let Adapter handle the heuristic.
-            return 0, False # False = This is fallback mode
+    def mark_processed(self, project, decision, score):
+        """
+        Saves the full project details + verdict to the archive.
+        """
+        with sqlite3.connect(self.db_name) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO processed_items 
+                (url, title, description, stars_total, velocity, prod_score, raw_text, decision, score, processed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                project.url,
+                project.title,
+                project.description,
+                project.metrics.stars_total,
+                project.metrics.stars_24h,       # This is the Velocity
+                project.signals.production_signals, # The Score
+                project.raw_text,
+                decision,
+                score,
+                datetime.now()
+            ))
+
+    # Add this inside DatabaseManager class in database.py
+    def has_history(self, url):
+        with sqlite3.connect(self.db_name) as conn:
+            # Check if we have ANY snapshot for this url
+            return conn.execute("SELECT 1 FROM metrics_history WHERE url=? LIMIT 1", (url,)).fetchone() is not None
+        
+    def is_waiting_room(self, url):
+        # Returns True if we saw this project less than 18 hours ago.
+        # This means it is still "Incubating" and we should silently skip it.
+        limit = datetime.now() - timedelta(hours=18)
+        with sqlite3.connect(self.db_name) as conn:
+            # Check if we have a record NEWER than the limit
+            return conn.execute(
+                "SELECT 1 FROM metrics_history WHERE url=? AND recorded_at > ? LIMIT 1", 
+                (url, limit)
+            ).fetchone() is not None
