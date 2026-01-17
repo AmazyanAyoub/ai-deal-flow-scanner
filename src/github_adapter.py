@@ -1,8 +1,8 @@
 import os
 from datetime import datetime, timezone, timedelta
 from github import Github, Auth
-from database import DatabaseManager
-from schemas import NormalizedProject, ProjectMetrics, ProductionSignals
+from src.database import DatabaseManager
+from src.schemas import NormalizedProject, ProjectMetrics, ProductionSignals
 
 class GitHubAdapter:
     def __init__(self):

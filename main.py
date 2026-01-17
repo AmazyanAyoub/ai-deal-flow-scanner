@@ -3,10 +3,10 @@ import json
 import time
 from datetime import datetime
 from dotenv import load_dotenv
-from github_adapter import GitHubAdapter
-from judge import JudgeAgent
+from src.github_adapter import GitHubAdapter
+from src.judge import JudgeAgent
 
-import log_saver
+from src.utils import log_saver
 log_saver.start_logging()
 # 1. Chargement des variables d'environnement (.env)
 load_dotenv()

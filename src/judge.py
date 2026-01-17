@@ -2,7 +2,7 @@ import os
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
-from schemas import NormalizedProject, JudgeOutput
+from src.schemas import NormalizedProject, JudgeOutput
 
 class JudgeAgent:
     def __init__(self):
